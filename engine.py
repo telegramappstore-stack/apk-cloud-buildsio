@@ -7,6 +7,7 @@ The UI only talks to the small API of BaseEngine.
 import json
 import os
 import random
+import socket
 import threading
 import time
 
@@ -127,8 +128,8 @@ class AndroidEngine(BaseEngine):
     def _f(self, name):
         return os.path.join(self.files, name)
 
-    def _svc(self):
-        """-> (state, since_ms, error) as written by the service; 'running' with a stale heartbeat = process gone."""
+    def _read_state(self):
+        """-> (state, since_ms, error) exactly as the service wrote it ('stopped' when the file is missing)."""
         try:
             with open(self._f(STATE_FILE), encoding="utf-8") as f:
                 st, hb, since, err = (f.read().split("\n", 3) + ["", "", ""])[:4]
@@ -137,6 +138,47 @@ class AndroidEngine(BaseEngine):
             return "stopped", 0, ""
         if st == "running" and time.time() * 1000 - hb > 10000:
             st = "stopped"
+        return st, since, err
+
+    def _tun_up(self):
+        """True while the VPN interface (198.18.0.1) exists - visible to every app, no service state needed."""
+        try:
+            ifs = self._ac("java.net.NetworkInterface").getNetworkInterfaces()
+            while ifs is not None and ifs.hasMoreElements():
+                ni = ifs.nextElement()
+                if not ni.isUp():
+                    continue
+                addrs = ni.getInetAddresses()
+                while addrs.hasMoreElements():
+                    if str(addrs.nextElement().getHostAddress()) == "198.18.0.1":
+                        return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _xray_port_open():
+        s = socket.socket()
+        s.settimeout(0.3)
+        try:
+            s.connect(("127.0.0.1", xc.LOCAL_PORT))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def _live(self):
+        """The tunnel really exists: VPN interface up AND Xray answering on its local port."""
+        return self._tun_up() and self._xray_port_open()
+
+    def _svc(self):
+        """-> (state, since_ms, error). The state file is preferred, but if it says nothing useful while the tunnel is
+        demonstrably up (old service build, file not written, ...) the live tunnel wins - a working VPN is never
+        reported as failed just because a status file is missing."""
+        st, since, err = self._read_state()
+        if st not in ("running", "error") and self._live():
+            return "running", since, ""
         return st, since, err
 
     def _write_state(self, st, since_ms):
@@ -207,12 +249,23 @@ class AndroidEngine(BaseEngine):
 
     def _wait(self, wanted, timeout, t_req):
         end = time.time() + timeout
+        up_since = None
         while time.time() < end and not self._cancel:
-            st, since, _ = self._svc()
+            st, since, _ = self._read_state()
             if st in wanted and since >= t_req:
                 return st
+            if "running" in wanted and self._live():             # file missing / old service: trust the live tunnel
+                up_since = up_since or time.time()
+                if time.time() - up_since >= 2.0:                # must stay up 2 s (not the previous session dying)
+                    return "running"
+            else:
+                up_since = None
             time.sleep(0.25)
         return None
+
+    def _diag(self):
+        st, since, err = self._read_state()
+        return "state-file=%s tun=%s xray-port=%s" % (st, self._tun_up(), self._xray_port_open())
 
     # -------------------------------------------------------------- API
     def connect(self, proxy):
@@ -280,13 +333,14 @@ class AndroidEngine(BaseEngine):
                 self._save_session()
                 self.t0, self.state, self.error = time.time(), "running", ""
                 return
-            last = self._svc()[2]
+            last = self._read_state()[2]
             if not last:
                 try:
                     with open(self._f(CRASH_FILE), encoding="utf-8", errors="ignore") as f:
                         last = "VPN service crashed: " + f.read()[:700]
                 except OSError:
                     last = "The VPN service never answered (not started or killed by Android)."
+                last += "  [" + self._diag() + "]"
             if not (not legacy and looks_like_xray_config_error(last)):
                 break
             self._stop_service()
